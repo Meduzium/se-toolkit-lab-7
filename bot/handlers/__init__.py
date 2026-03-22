@@ -9,6 +9,7 @@ from .help import handle_help
 from .health import handle_health
 from .labs import handle_labs
 from .scores import handle_scores
+from .natural_language import handle_natural_language, handle_natural_language_sync
 
 __all__ = [
     "handle_start",
@@ -16,4 +17,6 @@ __all__ = [
     "handle_health",
     "handle_labs",
     "handle_scores",
+    "handle_natural_language",
+    "handle_natural_language_sync",
 ]
