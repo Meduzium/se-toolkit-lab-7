@@ -1,7 +1,7 @@
 """LMS Telegram Bot entry point.
 
 Supports two modes:
-1. Test mode: `python bot.py --test "/command"` - prints response to stdout
+1. Test mode: `python bot.py --test "question"` - prints response to stdout
 2. Telegram mode: connects to Telegram API and handles messages
 """
 
@@ -12,7 +12,8 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import config
 from handlers import (
@@ -21,61 +22,83 @@ from handlers import (
     handle_health,
     handle_labs,
     handle_scores,
+    handle_natural_language_sync,
 )
+
+
+def create_main_keyboard() -> InlineKeyboardMarkup:
+    """Create inline keyboard with common actions.
+
+    Returns:
+        Inline keyboard markup with buttons for common queries.
+    """
+    builder = InlineKeyboardBuilder()
+
+    # Main action buttons
+    builder.button(text="📚 Лабораторные", callback_data="labs")
+    builder.button(text="📊 Оценки", callback_data="scores_help")
+    builder.button(text="🏆 Топ студентов", callback_data="top_help")
+    builder.button(text="📈 Статистика", callback_data="stats_help")
+
+    # Help buttons
+    builder.button(text="❓ Справка", callback_data="help")
+    builder.button(text="🔍 Проверка статуса", callback_data="health")
+
+    builder.adjust(2, 2, 2)  # 2 buttons per row
+    return builder.as_markup()
+
+
+def create_scores_keyboard(lab_id: str) -> InlineKeyboardMarkup:
+    """Create inline keyboard for lab-specific actions.
+
+    Args:
+        lab_id: Lab identifier.
+
+    Returns:
+        Inline keyboard markup with lab-specific buttons.
+    """
+    builder = InlineKeyboardBuilder()
+
+    builder.button(text="📊 Оценки", callback_data=f"scores_{lab_id}")
+    builder.button(text="📈 Проходные баллы", callback_data=f"pass_{lab_id}")
+    builder.button(text="🏆 Топ студентов", callback_data=f"top_{lab_id}")
+    builder.button(text="👥 Группы", callback_data=f"groups_{lab_id}")
+    builder.button(text="📅 Timeline", callback_data=f"timeline_{lab_id}")
+
+    builder.adjust(2, 2, 1)
+    return builder.as_markup()
 
 
 def parse_command(text: str) -> tuple[str, str | None]:
     """Parse command text into command name and arguments.
-    
+
     Args:
         text: Message text (e.g., "/scores lab-04" or "what labs are available").
-    
+
     Returns:
         Tuple of (command_name, argument).
     """
     text = text.strip()
-    
+
     # Check for command format (/command or /command arg)
     if text.startswith("/"):
         parts = text[1:].split(maxsplit=1)
         command = parts[0].lower()
         arg = parts[1] if len(parts) > 1 else None
         return command, arg
-    
-    # Natural language handling - route to appropriate handler
-    text_lower = text.lower()
-    if "start" in text_lower or "привет" in text_lower or "hello" in text_lower:
-        return "start", None
-    elif "help" in text_lower or "справк" in text_lower or "команд" in text_lower:
-        return "help", None
-    elif "health" in text_lower or "статус" in text_lower or "работает" in text_lower:
-        return "health", None
-    elif "lab" in text_lower or "лаборатор" in text_lower:
-        if "score" in text_lower or "оценк" in text_lower:
-            # Extract lab name from natural language
-            for word in text.split():
-                if word.lower().startswith("lab"):
-                    return "scores", word
-            return "labs", None
-        return "labs", None
-    elif "score" in text_lower or "оценк" in text_lower:
-        # Try to extract lab name
-        for word in text.split():
-            if word.lower().startswith("lab"):
-                return "scores", word
-        return "scores", None
-    
-    return "help", None
+
+    # Natural language - return special marker for LLM routing
+    return "natural", text
 
 
 def run_test_mode(command: str) -> None:
     """Run bot in test mode - call handler directly and print result.
-    
+
     Args:
-        command: Command text to process (e.g., "/start" or "/scores lab-04").
+        command: Command text to process (e.g., "/start" or "which lab has lowest pass rate").
     """
     cmd_name, arg = parse_command(command)
-    
+
     # Route to appropriate handler
     if cmd_name == "start":
         result = handle_start()
@@ -87,9 +110,13 @@ def run_test_mode(command: str) -> None:
         result = handle_labs()
     elif cmd_name == "scores":
         result = handle_scores(lab_name=arg)
+    elif cmd_name == "natural":
+        # Natural language routing via LLM
+        result = handle_natural_language_sync(arg)
     else:
-        result = handle_help()
-    
+        # Default to natural language processing
+        result = handle_natural_language_sync(command)
+
     # Print result to stdout
     print(result["text"])
     sys.exit(0)
@@ -99,7 +126,7 @@ def run_test_mode(command: str) -> None:
 async def cmd_start(message: Message) -> None:
     """Handle /start command from Telegram."""
     result = handle_start(user_id=str(message.from_user.id))
-    await message.answer(result["text"])
+    await message.answer(result["text"], reply_markup=create_main_keyboard())
 
 
 async def cmd_help(message: Message) -> None:
@@ -132,22 +159,76 @@ async def handle_message(message: Message) -> None:
     """Handle natural language messages from users."""
     text = message.text or ""
     cmd_name, arg = parse_command(text)
-    
+
     # Route to appropriate handler based on intent
     if cmd_name == "start":
         result = handle_start(user_id=str(message.from_user.id))
+        await message.answer(result["text"], reply_markup=create_main_keyboard())
     elif cmd_name == "help":
         result = handle_help(user_id=str(message.from_user.id))
+        await message.answer(result["text"])
     elif cmd_name == "health":
         result = handle_health(user_id=str(message.from_user.id))
+        await message.answer(result["text"])
     elif cmd_name == "labs":
         result = handle_labs(user_id=str(message.from_user.id))
+        await message.answer(result["text"])
     elif cmd_name == "scores":
         result = handle_scores(user_id=str(message.from_user.id), lab_name=arg)
+        await message.answer(result["text"])
+    elif cmd_name == "natural":
+        # Natural language processing via LLM intent router
+        result = await handle_natural_language(arg, user_id=str(message.from_user.id))
+        await message.answer(result["text"])
     else:
-        result = handle_help(user_id=str(message.from_user.id))
-    
-    await message.answer(result["text"])
+        # Fallback to natural language processing
+        result = await handle_natural_language(text, user_id=str(message.from_user.id))
+        await message.answer(result["text"])
+
+
+async def handle_callback_query(callback_query: types.CallbackQuery) -> None:
+    """Handle inline keyboard button callbacks.
+
+    Args:
+        callback_query: Callback query from inline button press.
+    """
+    data = callback_query.data
+
+    if data == "labs":
+        result = handle_labs(user_id=str(callback_query.from_user.id))
+        await callback_query.message.answer(result["text"])
+    elif data == "scores_help":
+        result = handle_help(user_id=str(callback_query.from_user.id))
+        await callback_query.message.answer(
+            "Для просмотра оценок напишите номер лаборатории, например: lab-01\n"
+            "Или выберите лабораторную из списка /labs"
+        )
+    elif data == "top_help":
+        await callback_query.message.answer(
+            "Для просмотра топ студентов напишите:\n"
+            "«топ 5 студентов в lab-01»\n"
+            "Или «top 10 lab-03»"
+        )
+    elif data == "stats_help":
+        await callback_query.message.answer(
+            "Я могу показать:\n"
+            "• Распределение оценок\n"
+            "• Проходные баллы по задачам\n"
+            "• Статистику по группам\n"
+            "• Timeline сдачи работ\n\n"
+            "Просто спросите меня!"
+        )
+    elif data == "help":
+        result = handle_help(user_id=str(callback_query.from_user.id))
+        await callback_query.message.answer(result["text"])
+    elif data == "health":
+        result = handle_health(user_id=str(callback_query.from_user.id))
+        await callback_query.message.answer(result["text"])
+    else:
+        # Handle lab-specific callbacks
+        await callback_query.message.answer(f"Обработка запроса: {data}")
+
+    await callback_query.answer()
 
 
 async def run_telegram_mode() -> None:
@@ -155,10 +236,10 @@ async def run_telegram_mode() -> None:
     if not config.bot_token:
         print("Error: BOT_TOKEN not found in .env.bot.secret", file=sys.stderr)
         sys.exit(1)
-    
+
     bot = Bot(token=config.bot_token)
     dp = Dispatcher()
-    
+
     # Register handlers
     dp.message.register(cmd_start, CommandStart())
     dp.message.register(cmd_help, Command("help"))
@@ -166,7 +247,10 @@ async def run_telegram_mode() -> None:
     dp.message.register(cmd_labs, Command("labs"))
     dp.message.register(cmd_scores, Command("scores"))
     dp.message.register(handle_message)  # Fallback for natural language
-    
+
+    # Register callback query handler for inline buttons
+    dp.callback_query.register(handle_callback_query)
+
     # Start polling
     print("Bot started...")
     await dp.start_polling(bot)
@@ -181,9 +265,9 @@ def main() -> None:
         metavar="COMMAND",
         help="Run in test mode with the specified command",
     )
-    
+
     args = parser.parse_args()
-    
+
     if args.test:
         run_test_mode(args.test)
     else:
