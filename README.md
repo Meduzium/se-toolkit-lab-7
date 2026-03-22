@@ -95,3 +95,61 @@ By the end of this lab, you should be able to say:
 ### Optional
 
 1. [Flutter Web Chatbot](./lab/tasks/optional/task-1.md)
+
+## Deploy
+
+### Prerequisites
+
+Ensure the following environment variables are set in `.env.docker.secret`:
+
+| Variable | Description |
+|----------|-------------|
+| `BOT_TOKEN` | Telegram bot token from @BotFather |
+| `LMS_API_KEY` | API key for the LMS backend |
+| `LLM_API_KEY` | API key for the LLM provider (e.g., OpenRouter) |
+| `LLM_API_BASE_URL` | LLM API base URL (default: `https://openrouter.ai/api/v1`) |
+| `LLM_API_MODEL` | LLM model to use (default: `openrouter/free`) |
+
+### Start the services
+
+```bash
+cd ~/se-toolkit-lab-7
+
+# Stop any running bot process (if migrating from nohup)
+pkill -f "bot.py" 2>/dev/null
+
+# Build and start all services
+docker compose --env-file .env.docker.secret up --build -d
+
+# Check service status
+docker compose --env-file .env.docker.secret ps
+```
+
+You should see the `bot` service running alongside `backend`, `postgres`, `caddy`.
+
+### Verify the deployment
+
+```bash
+# Check bot container logs
+docker compose --env-file .env.docker.secret logs bot --tail 20
+
+# Expected: "Application started" and "HTTP Request: POST .../getUpdates"
+```
+
+### Test in Telegram
+
+Send these commands to your bot:
+
+1. `/start` — welcome message
+2. `/health` — backend status
+3. "what labs are available?" — natural language query
+4. "which lab has the lowest pass rate?" — multi-step reasoning
+
+### Troubleshooting
+
+| Symptom | Solution |
+|---------|----------|
+| Bot container restarting | Check logs: `docker compose logs bot` |
+| `/health` fails | Ensure `LMS_API_BASE_URL` uses `http://backend:8000` (not `localhost`) |
+| LLM queries fail | Use `host.docker.internal` for local proxy, or direct URL for external |
+| "BOT_TOKEN is required" | Add `BOT_TOKEN` to `.env.docker.secret` |
