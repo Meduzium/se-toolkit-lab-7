@@ -1,6 +1,7 @@
 """Intent router service for natural language processing with LLM tool calling."""
 
 import json
+import re
 import sys
 from typing import Any
 
@@ -40,6 +41,82 @@ class IntentRouter:
         "You: [calls get_items] → [calls get_pass_rates for each lab] → [compares and answers]\n\n"
         "Always think step by step and use tools to get accurate information."
     )
+
+    def _detect_intent(self, user_message: str) -> str | None:
+        """Detect user intent from message for direct handling.
+
+        Args:
+            user_message: User's message text.
+
+        Returns:
+            Intent string or None if no pattern matched.
+        """
+        msg_lower = user_message.lower()
+
+        # Sync/data refresh intent
+        if any(kw in msg_lower for kw in ["sync", "refresh", "update", "reload", "load"]):
+            if any(kw in msg_lower for kw in ["data", "item", "log"]):
+                return "sync"
+
+        # Lowest/highest pass rate comparison
+        if any(kw in msg_lower for kw in ["lowest", "highest", "worst", "best"]):
+            if any(kw in msg_lower for kw in ["pass rate", "passrate", "score", "lab"]):
+                return "compare_pass_rates"
+
+        # Labs listing query - "what labs", "list labs", "labs available"
+        if any(kw in msg_lower for kw in ["what lab", "list lab", "lab available", "show lab", "labs are"]):
+            return "list_labs"
+
+        # Scores query - "show scores for lab X" or "lab 4 scores"
+        if any(kw in msg_lower for kw in ["score", "scores", "grade", "grades"]):
+            # Extract lab number
+            lab_match = re.search(r"lab[- ]?(\d+)", msg_lower)
+            if lab_match:
+                return f"scores:lab-{lab_match.group(1).zfill(2)}"
+
+        # Top learners query - "top N students in lab X"
+        if "top" in msg_lower and any(kw in msg_lower for kw in ["student", "learner", "person"]):
+            lab_match = re.search(r"lab[- ]?(\d+)", msg_lower)
+            limit_match = re.search(r"(\d+)", msg_lower)
+            if lab_match:
+                lab = f"lab-{lab_match.group(1).zfill(2)}"
+                limit = int(limit_match.group(1)) if limit_match else 5
+                return f"top_learners:{lab}:{limit}"
+
+        # Learners count query - "how many students" or "list students"
+        if any(kw in msg_lower for kw in ["how many student", "how many learner", "enrolled", "list student", "list learner"]):
+            return "learners"
+
+        # Greeting
+        if any(kw in msg_lower for kw in ["hello", "hi", "hey", "привет", "здравствуйте"]):
+            return "greeting"
+
+        return None
+
+    def _is_gibberish(self, text: str) -> bool:
+        """Check if text appears to be gibberish or random typing.
+
+        Args:
+            text: Text to check.
+
+        Returns:
+            True if text appears to be gibberish.
+        """
+        # Check for random keyboard patterns
+        gibberish_patterns = [
+            r"^[asdfghjkl]+$",
+            r"^[qwerty]+$",
+            r"^[zxcvbnm]+$",
+            r"^[aeiou]+$",
+            r"^[^aeiouаеиоуыэюя]{4,}$",  # 4+ consonants
+        ]
+        text_clean = text.lower().strip()
+        if len(text_clean) < 3:
+            return True
+        for pattern in gibberish_patterns:
+            if re.match(pattern, text_clean):
+                return True
+        return False
 
     def __init__(self, llm_client: LLMClient, lms_client: LMSClient) -> None:
         """Initialize the intent router.
@@ -112,6 +189,215 @@ class IntentRouter:
         else:
             return str(result)[:100]
 
+    async def _handle_sync_direct(self) -> str:
+        """Handle sync requests directly without LLM.
+
+        Returns:
+            Formatted sync result message.
+        """
+        try:
+            result = await self.lms_client.trigger_sync()
+            new_records = result.get("new_records", 0)
+            total_records = result.get("total_records", 0)
+            return (
+                f"✅ Sync complete!\n\n"
+                f"• New records loaded: {new_records}\n"
+                f"• Total records: {total_records}\n"
+                f"• Status: success"
+            )
+        except Exception as e:
+            return f"Sync failed: {str(e)}"
+
+    async def _handle_compare_pass_rates(self) -> str:
+        """Handle 'lowest/highest pass rate' queries directly without LLM.
+
+        Returns:
+            Formatted comparison message with lab names and percentages.
+        """
+        try:
+            # Get all labs
+            items = await self.lms_client.get_items()
+            labs = [item for item in items if item.get("type") == "lab"]
+
+            if not labs:
+                return "No labs found in the system."
+
+            # Get pass rates for each lab
+            lab_pass_rates = []
+            for lab in labs:
+                lab_id = lab.get("id", "")
+                lab_title = lab.get("title", f"Lab {lab_id}")
+                # Convert "Lab 01" to "lab-01" format
+                lab_number = re.search(r"Lab\s*(\d+)", lab_title)
+                if lab_number:
+                    lab_param = f"lab-{lab_number.group(1).zfill(2)}"
+                else:
+                    lab_param = f"lab-{str(lab_id).zfill(2)}"
+
+                try:
+                    pass_rates = await self.lms_client.get_pass_rates(lab=lab_param)
+                    if pass_rates:
+                        # Calculate average pass rate across all tasks
+                        avg_rate = sum(t.get("avg_score", 0) for t in pass_rates) / len(pass_rates)
+                        lab_pass_rates.append((lab_title, avg_rate, len(pass_rates)))
+                except Exception:
+                    continue
+
+            if not lab_pass_rates:
+                return "Could not retrieve pass rates for any lab."
+
+            # Sort by pass rate
+            lab_pass_rates.sort(key=lambda x: x[1])
+
+            # Format response
+            lowest = lab_pass_rates[0]
+            highest = lab_pass_rates[-1]
+
+            result_lines = [
+                "📊 Pass Rate Comparison:",
+                "",
+                f"🔴 Lowest: {lowest[0]} - {lowest[1]:.1f}% average ({lowest[2]} tasks)",
+                f"🟢 Highest: {highest[0]} - {highest[1]:.1f}% average ({highest[2]} tasks)",
+                "",
+                "All labs (sorted by avg pass rate):",
+            ]
+            for title, rate, tasks in lab_pass_rates:
+                result_lines.append(f"• {title}: {rate:.1f}%")
+
+            return "\n".join(result_lines)
+
+        except Exception as e:
+            return f"Error comparing pass rates: {str(e)}"
+
+    def _handle_gibberish(self) -> str:
+        """Handle gibberish/unrecognized input.
+
+        Returns:
+            Help message with available commands.
+        """
+        return (
+            "I'm not sure I understood that. 😕\n\n"
+            "I can help you with:\n"
+            "• List available labs and tasks\n"
+            "• Show scores and pass rates\n"
+            "• Compare lab performance\n"
+            "• Show top students\n"
+            "• Sync data from autochecker\n\n"
+            "Try asking:\n"
+            "• 'which labs are available?'\n"
+            "• 'show scores for lab-01'\n"
+            "• 'which lab has the lowest pass rate?'\n"
+            "• 'sync the data'"
+        )
+
+    async def _handle_scores(self, lab: str) -> str:
+        """Handle scores query directly.
+
+        Args:
+            lab: Lab identifier.
+
+        Returns:
+            Formatted scores distribution message.
+        """
+        try:
+            result = await self.lms_client.get_scores(lab=lab)
+            lines = [f"📊 Score Distribution for {lab}:", ""]
+            for bucket in result:
+                lines.append(f"• {bucket['bucket']}: {bucket['count']} students")
+            total = sum(b['count'] for b in result)
+            lines.append(f"\nTotal submissions: {total}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error getting scores for {lab}: {str(e)}"
+
+    async def _handle_top_learners(self, lab: str, limit: int) -> str:
+        """Handle top learners query directly.
+
+        Args:
+            lab: Lab identifier.
+            limit: Number of top learners to return.
+
+        Returns:
+            Formatted top learners message.
+        """
+        try:
+            result = await self.lms_client.get_top_learners(lab=lab, limit=limit)
+            if not result:
+                return f"No data found for {lab}."
+            lines = [f"🏆 Top {limit} Learners in {lab}:", ""]
+            for i, learner in enumerate(result, 1):
+                lines.append(f"{i}. Learner #{learner['learner_id']}: {learner['avg_score']:.1f} avg ({learner['attempts']} attempts)")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error getting top learners: {str(e)}"
+
+    async def _handle_learners(self) -> str:
+        """Handle learners count query directly.
+
+        Returns:
+            Formatted learners count message.
+        """
+        try:
+            result = await self.lms_client.get_learners()
+            count = len(result)
+            # Count by group
+            groups = {}
+            for learner in result:
+                group = learner.get('student_group', 'unknown')
+                groups[group] = groups.get(group, 0) + 1
+            
+            lines = [
+                f"👥 Enrolled Students: {count}",
+                "",
+                "By group:",
+            ]
+            for group, cnt in sorted(groups.items()):
+                lines.append(f"• {group}: {cnt}")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error getting learners: {str(e)}"
+
+    async def _handle_greeting(self) -> str:
+        """Handle greeting message.
+
+        Returns:
+            Friendly greeting response.
+        """
+        return (
+            "Hello! 👋 I'm your LMS assistant. I can help you with:\n\n"
+            "• List available labs and tasks\n"
+            "• Show scores and pass rates for any lab\n"
+            "• Compare lab performance (lowest/highest pass rates)\n"
+            "• Show top students in a lab\n"
+            "• Count enrolled students\n"
+            "• Sync data from autochecker\n\n"
+            "Just ask me anything about your labs!"
+        )
+
+    async def _handle_list_labs(self) -> str:
+        """Handle labs listing query directly.
+
+        Returns:
+            Formatted list of labs and tasks.
+        """
+        try:
+            items = await self.lms_client.get_items()
+            labs = [item for item in items if item.get("type") == "lab"]
+            tasks = [item for item in items if item.get("type") == "task"]
+            
+            lines = ["📚 Available Labs:", ""]
+            for lab in labs:
+                lab_id = lab.get("id", "")
+                lab_title = lab.get("title", f"Lab {lab_id}")
+                # Count tasks for this lab
+                lab_tasks = [t for t in tasks if t.get("parent_id") == lab_id]
+                lines.append(f"• {lab_title} ({len(lab_tasks)} tasks)")
+            
+            lines.append(f"\nTotal: {len(labs)} labs, {len(tasks)} tasks")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"Error getting labs: {str(e)}"
+
     async def route(self, user_message: str) -> str:
         """Route a user message through the LLM tool calling loop.
 
@@ -121,6 +407,39 @@ class IntentRouter:
         Returns:
             Final response to send to the user.
         """
+        # First, check for gibberish
+        if self._is_gibberish(user_message):
+            self._debug(f"[gibberish] Detected: {user_message}")
+            return self._handle_gibberish()
+
+        # Check for direct-handling intents (bypass LLM for reliability)
+        intent = self._detect_intent(user_message)
+        if intent == "sync":
+            self._debug(f"[direct] Handling sync request")
+            return await self._handle_sync_direct()
+        elif intent == "compare_pass_rates":
+            self._debug(f"[direct] Handling pass rate comparison")
+            return await self._handle_compare_pass_rates()
+        elif intent == "list_labs":
+            self._debug(f"[direct] Handling list labs request")
+            return await self._handle_list_labs()
+        elif intent == "greeting":
+            self._debug(f"[direct] Handling greeting")
+            return await self._handle_greeting()
+        elif intent == "learners":
+            self._debug(f"[direct] Handling learners query")
+            return await self._handle_learners()
+        elif intent and intent.startswith("scores:"):
+            lab = intent.split(":")[1]
+            self._debug(f"[direct] Handling scores query for {lab}")
+            return await self._handle_scores(lab)
+        elif intent and intent.startswith("top_learners:"):
+            parts = intent.split(":")
+            lab = parts[1]
+            limit = int(parts[2]) if len(parts) > 2 else 5
+            self._debug(f"[direct] Handling top learners query for {lab}, limit={limit}")
+            return await self._handle_top_learners(lab, limit)
+
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
@@ -184,6 +503,27 @@ class IntentRouter:
 
             except Exception as e:
                 self._debug(f"[error] LLM call failed: {str(e)}")
+                # Fallback: try direct handling for common queries
+                # Re-detect intent and handle directly
+                fallback_intent = self._detect_intent(user_message)
+                if fallback_intent == "sync":
+                    return await self._handle_sync_direct()
+                elif fallback_intent == "compare_pass_rates":
+                    return await self._handle_compare_pass_rates()
+                elif fallback_intent == "list_labs":
+                    return await self._handle_list_labs()
+                elif fallback_intent == "learners":
+                    return await self._handle_learners()
+                elif fallback_intent and fallback_intent.startswith("scores:"):
+                    lab = fallback_intent.split(":")[1]
+                    return await self._handle_scores(lab)
+                elif fallback_intent and fallback_intent.startswith("top_learners:"):
+                    parts = fallback_intent.split(":")
+                    lab = parts[1]
+                    limit = int(parts[2]) if len(parts) > 2 else 5
+                    return await self._handle_top_learners(lab, limit)
+                elif fallback_intent == "greeting":
+                    return await self._handle_greeting()
                 return f"Sorry, I encountered an error: {str(e)}"
 
         # Max iterations reached or loop detected
