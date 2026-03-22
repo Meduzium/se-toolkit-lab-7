@@ -4,7 +4,7 @@
 
 This document outlines the development plan for the LMS (Learning Management System) Telegram bot. The bot provides students with access to their academic information, including lab scores, course materials, and automated assistance powered by an LLM.
 
-## Architecture Principles
+## Architecture Principles.
 
 ### Testable Handler Architecture (P0.1)
 
